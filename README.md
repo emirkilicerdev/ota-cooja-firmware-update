@@ -74,17 +74,37 @@ iki davranış** elde etme yöntemidir.
 - **Blok boyutu:** `CHUNK_SIZE = 48 byte` (6LoWPAN/802.15.4 tek paketine sığacak şekilde)
 - **Maksimum paket:** `8 + 48 = 56 byte` — IEEE 802.15.4'ün 127 byte MTU'suna rahatça sığar
 
-### ACK Paketi (Alıcı → Gönderici)
+### FINAL Paketi (Gönderici → Alıcı) — Tüm-İmaj CRC Doğrulaması
+
+Tüm bloklar gönderildikten sonra, gönderici **beklenen CRC32'yi** özel bir pakette yollar.
+Normal veri paketiyle aynı yapı, ama **blok no = `0xFFFF`** (FINAL işareti) ve yük = 4 byte CRC:
 
 ```
-┌──────┬──────┬──────────────┬──────────────┐
-│ 'A'  │ 'C'  │ Blok No (üst) │ Blok No (alt) │
-│ 0x41 │ 0x43 │   1 byte      │   1 byte      │
-└──────┴──────┴──────────────┴──────────────┘
+┌─────────┬──────────┬──────────┬───────┬──────────┬────────────────┐
+│ Magic   │ 0xFFFF   │ Toplam   │ Boyu=4│ Checksum │  CRC32 (4 byte) │
+│ 2 byte  │ 2 byte   │ 2 byte   │ 1 byte│ 1 byte   │   big-endian    │
+└─────────┴──────────┴──────────┴───────┴──────────┴────────────────┘
 ```
 
-- **ACK uzunluğu:** **4 byte** (sabit, ikili/binary format)
-- `[A][C]` imzası + onaylanan bloğun numarası (16-bit, big-endian)
+- **`0xFFFF` neden?** Gerçek blok no'lar 0–99 arasıdır, `0xFFFF` asla çakışmaz → "bu bir
+  veri bloğu değil, CRC doğrulama paketidir" işareti olarak kullanılır.
+
+### ACK / NACK Paketi (Alıcı → Gönderici)
+
+```
+ACK   ┌──────┬──────┬──────────────┬──────────────┐
+      │ 'A'  │ 'C'  │ Blok No (üst) │ Blok No (alt) │   "aldım, onayladım"
+      └──────┴──────┴──────────────┴──────────────┘
+
+NACK  ┌──────┬──────┬──────┬──────┐
+      │ 'N'  │ 'K'  │  0   │  0   │   "CRC tutmadı, baştan gönder!"
+      └──────┴──────┴──────┴──────┘
+```
+
+- **ACK uzunluğu:** **4 byte** — `[A][C]` + onaylanan blok no (16-bit, big-endian).
+  Blok ACK'i için blok no 0–99; **FINAL ACK** için blok no `0xFFFF` (CRC onaylandı).
+- **NACK uzunluğu:** **4 byte** — `[N][K][0][0]`. Alıcı, tüm-imaj CRC'si tutmazsa bunu
+  gönderir; gönderici blok 0'dan **yeniden başlar**.
 
 ---
 
@@ -95,8 +115,8 @@ iki davranış** elde etme yöntemidir.
 | 1 | **Parçalama** — firmware'i 48 byte bloklara böl | `udp-client.c → send_chunk()` |
 | 2 | **Sıralama** — her bloğa blok no taşı | Başlık `[2-3]` blok no |
 | 3 | **Parça doğrulama** — blok başına XOR checksum | `checksum8()` (her iki tarafta) |
-| 4 | **Tüm-imaj doğrulama** — CRC32 | `crc32_stream_*()` (alıcıda) |
-| 5 | **Yeniden gönderim** — timeout + retry | `TIMEOUT_SEC`, `MAX_RETRIES` |
+| 4 | **Tüm-imaj doğrulama** — CRC32 **karşılaştırması** | Gönderici FINAL paketiyle beklenen CRC'yi yollar, alıcı kendi `crc32_stream_*()` sonucuyla **karşılaştırır** |
+| 5 | **Yeniden gönderim** — blok + tüm-imaj | Blok: `TIMEOUT_SEC`/`MAX_RETRIES`; tüm-imaj: CRC tutmazsa **NACK → baştan** |
 | 6 | **Pencereleme** — stop-and-wait | `PROCESS_WAIT_EVENT_UNTIL(... \|\| !waiting_ack)` |
 | 7 | **Durum yönetimi** — eksik/gelen blok takibi | `next_expected`, duplikat kontrolü |
 | + | **Kalıcı depolama** — flash benzeri saklama | CFS/Coffee (`cfs_write`) |
@@ -245,12 +265,59 @@ crc32_stream_final(void)
   Kötü niyetli (kasıtlı) değişikliğe karşı SHA-256 gibi kriptografik bir hash gerekir.
   Bu projede amaç **iletim bütünlüğü** olduğundan CRC32 uygundur.
 
-Alıcı, transfer bitince hesaplanan CRC32'yi loglar (`udp-server.c`):
+### 3. Tüm-İmaj CRC Doğrulaması ve Yeniden Gönderim ⭐⭐
 
+CRC32'yi sadece **hesaplamak** yetmez — bir **referansla karşılaştırmak** gerekir, yoksa
+checksum'ın kaçırdığı hatayı yakalama gücü kullanılmaz. Sistemimiz şöyle çalışır:
+
+**1) Gönderici, beklenen CRC'yi kendi hesaplar** (`udp-client.c → compute_firmware_crc`):
 ```c
-fw_crc = crc32_stream_final();
-LOG_INFO("Hesaplanan CRC32: 0x%08lx\n", (unsigned long)fw_crc);
+firmware_crc = compute_firmware_crc();   /* firmware_payload üzerinden CRC32 */
 ```
+
+**2) Tüm bloklar gidince, FINAL paketiyle bu CRC'yi yollar** (`send_final`):
+```c
+/* Payload = 4 byte CRC32, blok no = 0xFFFF (FINAL işareti) */
+packet[HEADER_LEN + 0] = (uint8_t)(crc >> 24);
+...
+packet[2] = 0xFF; packet[3] = 0xFF;       /* FINAL_MARKER */
+simple_udp_sendto(&udp_conn, packet, HEADER_LEN + 4, dest);
+```
+
+**3) Alıcı, gelen CRC'yi kendi hesabıyla KARŞILAŞTIRIR** (`udp-server.c`):
+```c
+if(chunk_no == FINAL_MARKER) {
+  uint32_t expected_crc = /* paketten 4 byte oku */;
+  uint32_t my_crc = crc32_stream_final();
+
+  if(my_crc == expected_crc) {
+    /* ✅ TUTTU → FINAL ACK gönder, transfer tamam, metadata güncelle */
+    ack[0]='A'; ack[1]='C'; ack[2]=0xFF; ack[3]=0xFF;
+    simple_udp_sendto(&udp_conn, ack, 4, sender_addr);
+    transfer_complete = 1;
+  } else {
+    /* ❌ TUTMADI → NACK gönder, durumu sıfırla (sender baştan yollar) */
+    ack[0]='N'; ack[1]='K'; ack[2]=0; ack[3]=0;
+    simple_udp_sendto(&udp_conn, ack, 4, sender_addr);
+    next_expected = 0; received_chunks = 0; crc32_stream_init();
+  }
+  return;
+}
+```
+
+**4) Gönderici NACK alırsa blok 0'dan yeniden başlar** (`udp-client.c → callback`):
+```c
+if(data[0] == 'N' && data[1] == 'K') {   /* NACK */
+  need_restart = 1;                       /* ana döngü current_chunk=0 yapar */
+  ...
+}
+```
+
+> 💡 **Önemli tasarım kararı:** Alıcı, tüm bloklar gelse bile **transfer'i bitmiş saymaz**
+> — FINAL/CRC paketi gelip doğrulanana kadar bekler. Böylece blok başına checksum'ın
+> kaçırabileceği bir hata, tüm-imaj CRC32 karşılaştırmasıyla yakalanır ve transfer
+> baştan istenir. Bu, şartname madde 4 (**tüm-imaj doğrulama**) ve madde 5
+> (**yeniden gönderim**) gereksinimlerini tam karşılar.
 
 ---
 
@@ -482,7 +549,7 @@ cooja --no-gui --autostart BIL304-OS-Project-1.csc
 ## ✅ Beklenen Çıktı (Cooja Log)
 
 ```
-[2] OTA Sender: 4800 byte, 100 blok
+[2] === OTA Sender: 4800 byte, 100 blok, CRC32=0xd1c528aa ===
 [3] Dugum 3: relay modunda, OTA gonderici degil.
 [2] Blok 1/100 gonderildi | offset=0 | 48 byte | cs=0x82
 [1] Blok 1/100 | offset=0 | 48 byte | cs=OK | toplam=1
@@ -490,12 +557,18 @@ cooja --no-gui --autostart BIL304-OS-Project-1.csc
    ...
 [2] Blok 100/100 gonderildi | offset=4752 | 48 byte | cs=0xad
 [1] Blok 100/100 | offset=4752 | 48 byte | cs=OK | toplam=100
-[1] Hesaplanan CRC32: 0xd1c528aa
-[1] Yuklenmeye hazir yeni firmware alimi tamamlandi!
+[1] Tum 100 blok alindi, FINAL (CRC) paketi bekleniyor...
+[2] === TUM 100 BLOK GONDERILDI, CRC dogrulamasi yollaniyor ===
+[2] FINAL paketi gonderildi | beklenen CRC32=0xd1c528aa
+[1] CRC32 DOGRULANDI! beklenen=0xd1c528aa hesaplanan=0xd1c528aa
 [1] Slot B VERIFIED: v2 boyut=4800 crc=0xd1c528aa
 [1] Slot B PENDING: sonraki acilista yeni firmware aktif olacak.
-[2] === OTA TRANSFERI TAMAMLANDI! ===
+[2] FINAL ACK alindi: CRC dogrulandi, transfer TAMAM!
+[2] === OTA TRANSFERI BASARIYLA TAMAMLANDI! ===
 ```
+
+> İki CRC değeri (gönderici hesabı + alıcı hesabı) **birebir aynı** (`0xd1c528aa`) →
+> firmware bire bir, eksiksiz ve doğru sırada ulaştı.
 
 ---
 

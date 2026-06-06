@@ -33,6 +33,7 @@
 #define CHUNK_SIZE        48
 #define HEADER_LEN        8
 #define OTA_MAGIC         0xF17Eu
+#define FINAL_MARKER      0xFFFFu   /* chunk_no=0xFFFF -> tum-imaj CRC paketi */
 #define FIRMWARE_FILE     "ota_new.bin"
 #define NEW_FW_VERSION    2u
 
@@ -161,6 +162,47 @@ udp_rx_callback(struct simple_udp_connection *c,
     return;
   }
 
+  /* --- 5b. FINAL paketi mi? (tum-imaj CRC dogrulamasi) ---
+   *
+   * chunk_no == 0xFFFF gelirse bu normal veri degil, CRC dogrulama paketidir.
+   * Payload = gondericinin beklediği 4 byte CRC32.
+   * Bizim streaming hesabimizla KARSILASTIRIYORUZ:
+   *   - Tutarsa  -> FINAL ACK gonder, transfer_complete=1 (is bitti)
+   *   - Tutmazsa -> NACK gonder, durumu sifirla (sender bastan yollasin)
+   */
+  if(chunk_no == FINAL_MARKER) {
+    uint32_t expected_crc =
+        ((uint32_t)data[HEADER_LEN + 0] << 24) |
+        ((uint32_t)data[HEADER_LEN + 1] << 16) |
+        ((uint32_t)data[HEADER_LEN + 2] << 8)  |
+        ((uint32_t)data[HEADER_LEN + 3]);
+    uint32_t my_crc = crc32_stream_final();
+
+    if(my_crc == expected_crc) {
+      LOG_INFO("CRC32 DOGRULANDI! beklenen=0x%08lx hesaplanan=0x%08lx\n",
+               (unsigned long)expected_crc, (unsigned long)my_crc);
+      /* FINAL ACK gonder: [A][C][0xFF][0xFF] */
+      ack[0] = 'A'; ack[1] = 'C'; ack[2] = 0xFF; ack[3] = 0xFF;
+      simple_udp_sendto(&udp_conn, ack, 4, sender_addr);
+
+      transfer_complete = 1;
+      process_poll(&udp_server_process);
+    } else {
+      LOG_INFO("CRC32 HATASI! beklenen=0x%08lx hesaplanan=0x%08lx -> NACK\n",
+               (unsigned long)expected_crc, (unsigned long)my_crc);
+      /* NACK gonder: [N][K][0][0] -> sender bastan baslasin */
+      ack[0] = 'N'; ack[1] = 'K'; ack[2] = 0; ack[3] = 0;
+      simple_udp_sendto(&udp_conn, ack, 4, sender_addr);
+
+      /* Durumu sifirla: yeni transfere hazirlan */
+      next_expected = 0;
+      received_chunks = 0;
+      total_fw_size = 0;
+      crc32_stream_init();
+    }
+    return;
+  }
+
   /* --- 6. Transfer zaten bittiyse sadece ACK gonder --- */
   if(transfer_complete) {
     ack[0] = 'A'; ack[1] = 'C';
@@ -241,10 +283,13 @@ udp_rx_callback(struct simple_udp_connection *c,
   ack[3] = (uint8_t)(chunk_no);
   simple_udp_sendto(&udp_conn, ack, 4, sender_addr);
 
-  /* --- 13. Tum bloklar alindiysa process'i uyandır --- */
+  /* --- 13. Tum bloklar geldi mi? ---
+   * ARTIK BURADA transfer_complete YAPMIYORUZ! Bitisi FINAL/CRC paketi belirler.
+   * Tum bloklar gelse bile, gonderici CRC dogrulamasi yollayana kadar bekleriz.
+   * Boylece checksum'in kacirdigi bir hatayi CRC32 yakalayabilir. */
   if(received_chunks >= total_chunks) {
-    transfer_complete = 1;
-    process_poll(&udp_server_process);
+    LOG_INFO("Tum %u blok alindi, FINAL (CRC) paketi bekleniyor...\n",
+             total_chunks);
   }
 }
 

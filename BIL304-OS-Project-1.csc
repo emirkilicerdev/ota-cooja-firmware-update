@@ -143,10 +143,10 @@ while (!otaDone) {
   /* Her mote mesajini ekrana yazdir */
   log.log("[" + id + "] " + msg + "\n");
 
-  /* OTA tamamlandinda server bu mesaji yazar */
-  if (msg.contains("OTA TRANSFERI TAMAMLANDI") ||
-      msg.contains("PENDING: sonraki")) {
-    log.log("\n=== TEST BASARILI: OTA Tamamlandi! ===\n");
+  /* Gonderici, FINAL ACK alip CRC dogrulaninca bu mesaji yazar.
+   * Boylece tum gidis-donus (sender->alici->sender) tamamlandigini dogrulariz. */
+  if (msg.contains("BASARIYLA TAMAMLANDI")) {
+    log.log("\n=== TEST BASARILI: OTA + CRC dogrulama tamamlandi! ===\n");
     otaDone = true;
     log.testOK();
   }

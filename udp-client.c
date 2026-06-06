@@ -22,6 +22,11 @@
 #define TIMEOUT_SEC   5           /* ACK icin bekleme suresi (saniye) */
 #define MAX_RETRIES   5           /* Max kac kez tekrar gonderelim? */
 
+/* FINAL_MARKER: ozel blok numarasi. chunk_no = 0xFFFF gelirse bu normal bir
+ * veri blogu degil, "tum-imaj CRC dogrulama" paketidir. Gercek blok no'lar
+ * 0-99 oldugundan 0xFFFF asla cakismaz. */
+#define FINAL_MARKER  0xFFFFu
+
 /* Toplam blok sayisi: 4800 / 48 = 100 blok */
 #define TOTAL_CHUNKS  ((uint16_t)((FIRMWARE_PAYLOAD_LEN + CHUNK_SIZE - 1u) / CHUNK_SIZE))
 
@@ -34,7 +39,10 @@ static struct simple_udp_connection udp_conn;
 static uint16_t current_chunk;   /* Simdi hangi bloku gonderiyoruz? */
 static uint8_t  waiting_ack;     /* ACK bekleniyor mu? 1=evet, 0=hayir */
 static uint8_t  retries;         /* Kac kez tekrar denedik? */
-static uint8_t  transfer_done;   /* Transfer tamamlandi mi? */
+static uint8_t  sending_final;   /* 1 = artik FINAL paketi gonderiyoruz */
+static uint8_t  final_acked;     /* 1 = alici CRC'yi onayladi, is bitti */
+static uint8_t  need_restart;    /* 1 = NACK geldi, blok 0'dan basla */
+static uint32_t firmware_crc;    /* tum firmware'in CRC32'si (bir kez hesaplanir) */
 
 /* Surecimizi tanimliyoruz */
 PROCESS(ota_sender_process, "OTA Sender");
@@ -106,6 +114,70 @@ send_chunk(const uip_ipaddr_t *dest, uint16_t chunk_no)
 }
 
 /*---------------------------------------------------------------------------*/
+/* YARDIMCI FONKSIYON: Tum firmware'in CRC32'sini hesapla
+ *
+ * Gonderici, gondereceği firmware'in dogru CRC'sini onceden bilmeli ki
+ * aliciya "beklenen deger bu" diye yollasin. firmware_payload flash'ta
+ * (rodata) durdugundan tek tek okuyup hesapliyoruz - RAM'e yuklemeye gerek yok.
+ * Alici da ayni byte'lar uzerinden ayni sirayla hesapladigi icin sonuc ESIT olmali.
+ */
+static uint32_t
+compute_firmware_crc(void)
+{
+  uint32_t crc = 0xFFFFFFFFu;
+  uint32_t n;
+  for(n = 0; n < FIRMWARE_PAYLOAD_LEN; n++) {
+    uint8_t i;
+    crc ^= firmware_payload[n];
+    for(i = 0; i < 8; i++) {
+      if(crc & 1u) {
+        crc = (crc >> 1) ^ 0xEDB88320u;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return ~crc;
+}
+
+/*---------------------------------------------------------------------------*/
+/* YARDIMCI FONKSIYON: FINAL paketi gonder (tum-imaj CRC dogrulamasi)
+ *
+ * Tum bloklar gidince, beklenen CRC'yi bu ozel pakette yolluyoruz.
+ * Paket yapisi normal blokla ayni ama:
+ *   - chunk_no = 0xFFFF (FINAL_MARKER) -> "bu CRC paketi"
+ *   - payload  = 4 byte CRC32 (big-endian)
+ */
+static void
+send_final(const uip_ipaddr_t *dest, uint32_t crc)
+{
+  static uint8_t packet[HEADER_LEN + 4];
+  uint8_t cs;
+
+  /* Payload = 4 byte CRC32 (yuksek byte once) */
+  packet[HEADER_LEN + 0] = (uint8_t)(crc >> 24);
+  packet[HEADER_LEN + 1] = (uint8_t)(crc >> 16);
+  packet[HEADER_LEN + 2] = (uint8_t)(crc >> 8);
+  packet[HEADER_LEN + 3] = (uint8_t)(crc);
+
+  cs = checksum8(&packet[HEADER_LEN], 4);
+
+  packet[0] = (uint8_t)(OTA_MAGIC >> 8);
+  packet[1] = (uint8_t)(OTA_MAGIC);
+  packet[2] = (uint8_t)(FINAL_MARKER >> 8);   /* 0xFF */
+  packet[3] = (uint8_t)(FINAL_MARKER);        /* 0xFF */
+  packet[4] = (uint8_t)(TOTAL_CHUNKS >> 8);
+  packet[5] = (uint8_t)(TOTAL_CHUNKS);
+  packet[6] = 4;                               /* payload_len = 4 */
+  packet[7] = cs;
+
+  LOG_INFO("FINAL paketi gonderildi | beklenen CRC32=0x%08lx\n",
+           (unsigned long)crc);
+
+  simple_udp_sendto(&udp_conn, packet, HEADER_LEN + 4, dest);
+}
+
+/*---------------------------------------------------------------------------*/
 /* CALLBACK: Alicidan ACK geldiginde bu fonksiyon cagrilir
  * Bu bir protothread degil, normal C fonksiyonu.
  * Dolayisiyla PROCESS_WAIT gibi komutlar kullanılamaz.
@@ -121,13 +193,38 @@ udp_rx_callback(struct simple_udp_connection *c,
 {
   uint16_t acked_chunk;
 
-  /* ACK paketi: [0]='A' [1]='C' [2]=chunk_yuksek [3]=chunk_dusuk */
-  if(datalen < 4 || data[0] != 'A' || data[1] != 'C') {
-    return; /* OTA ACK degil, yoksay */
+  if(datalen < 4) {
+    return; /* cok kisa, OTA cevabi degil */
+  }
+
+  /* ── NACK paketi: [0]='N' [1]='K' → "CRC tutmadi, BASTAN gonder" ── */
+  if(data[0] == 'N' && data[1] == 'K') {
+    LOG_INFO("NACK alindi: CRC tutmadi, transfer BASTAN baslayacak!\n");
+    need_restart = 1;
+    sending_final = 0;
+    waiting_ack = 0;
+    retries = 0;
+    process_poll(&ota_sender_process);
+    return;
+  }
+
+  /* ── ACK paketi: [0]='A' [1]='C' [2]=chunk_yuksek [3]=chunk_dusuk ── */
+  if(data[0] != 'A' || data[1] != 'C') {
+    return; /* OTA cevabi degil, yoksay */
   }
 
   acked_chunk = ((uint16_t)data[2] << 8) | data[3];
 
+  /* ── FINAL ACK: alici CRC'yi onayladi (chunk 0xFFFF) ── */
+  if(acked_chunk == FINAL_MARKER) {
+    LOG_INFO("FINAL ACK alindi: CRC dogrulandi, transfer TAMAM!\n");
+    final_acked = 1;
+    waiting_ack = 0;
+    process_poll(&ota_sender_process);
+    return;
+  }
+
+  /* ── Normal blok ACK ── */
   if(acked_chunk == current_chunk) {
     LOG_INFO("ACK alindi: Blok %u onaylandi\n", acked_chunk);
     waiting_ack = 0;  /* ACK geldi! */
@@ -162,22 +259,36 @@ PROCESS_THREAD(ota_sender_process, ev, data)
 
   if(node_id == 2) {
     /* ── Sadece Dugum 2 gonderici rolundedir ── */
-    LOG_INFO("=== OTA Sender: %u byte, %u blok ===\n",
-             (unsigned)FIRMWARE_PAYLOAD_LEN, (unsigned)TOTAL_CHUNKS);
+
+    /* Tum firmware'in CRC32'sini bir kez hesapla (aliciya yollayacagiz) */
+    firmware_crc = compute_firmware_crc();
+
+    LOG_INFO("=== OTA Sender: %u byte, %u blok, CRC32=0x%08lx ===\n",
+             (unsigned)FIRMWARE_PAYLOAD_LEN, (unsigned)TOTAL_CHUNKS,
+             (unsigned long)firmware_crc);
 
     /* RPL aginin kurulmasi icin bekle */
     LOG_INFO("Ag kurulumu bekleniyor (10 sn)...\n");
     etimer_set(&timer, 10 * CLOCK_SECOND);
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
 
-    /* ── ANA GONDERIM DONGUSU ── */
-    while(!transfer_done) {
+    /* ── ANA GONDERIM DONGUSU ──
+     * Iki faz var:
+     *   1) BLOK FAZI : 0..99 bloklarini stop-and-wait ile gonder
+     *   2) FINAL FAZI: tum bloklar gidince beklenen CRC'yi yolla
+     * Alici CRC'yi onaylayinca (final_acked) is biter.
+     * Alici NACK yollarsa (need_restart) blok 0'dan yeniden baslariz.
+     */
+    while(!final_acked) {
 
-      /* Hepsi gonderildi mi? */
-      if(current_chunk >= TOTAL_CHUNKS) {
-        LOG_INFO("=== TUM %u BLOK GONDERILDI! ===\n", (unsigned)TOTAL_CHUNKS);
-        transfer_done = 1;
-        break;
+      /* NACK geldiyse: durumu sifirla, blok 0'dan basla */
+      if(need_restart) {
+        LOG_INFO("=== BASTAN BASLANIYOR (CRC tutmadi) ===\n");
+        current_chunk = 0;
+        sending_final = 0;
+        waiting_ack = 0;
+        retries = 0;
+        need_restart = 0;
       }
 
       /* Ag hazir mi? */
@@ -189,31 +300,59 @@ PROCESS_THREAD(ota_sender_process, ev, data)
         continue;
       }
 
-      /* Timeout kontrolu: onceki bloga ACK gelmedi mi? */
-      if(waiting_ack) {
-        retries++;
-        if(retries > MAX_RETRIES) {
-          LOG_INFO("HATA: Blok %u icin %u deneme yapildi, atlaniyor!\n",
-                   (unsigned)current_chunk, (unsigned)MAX_RETRIES);
-          current_chunk++;
-          waiting_ack = 0;
-          retries = 0;
-          continue;
+      if(current_chunk < TOTAL_CHUNKS) {
+        /* ════════ BLOK FAZI ════════ */
+
+        /* Timeout kontrolu: onceki bloga ACK gelmedi mi? */
+        if(waiting_ack) {
+          retries++;
+          if(retries > MAX_RETRIES) {
+            LOG_INFO("HATA: Blok %u icin %u deneme, atlaniyor!\n",
+                     (unsigned)current_chunk, (unsigned)MAX_RETRIES);
+            current_chunk++;
+            waiting_ack = 0;
+            retries = 0;
+            continue;
+          }
+          LOG_INFO("Timeout! Blok %u tekrar (%u/%u)...\n",
+                   (unsigned)current_chunk, (unsigned)retries, (unsigned)MAX_RETRIES);
         }
-        LOG_INFO("Timeout! Blok %u tekrar (%u/%u)...\n",
-                 (unsigned)current_chunk, (unsigned)retries, (unsigned)MAX_RETRIES);
+
+        send_chunk(&dest_ipaddr, current_chunk);
+        waiting_ack = 1;
+
+      } else {
+        /* ════════ FINAL FAZI (tum bloklar gitti) ════════ */
+
+        if(!sending_final) {
+          LOG_INFO("=== TUM %u BLOK GONDERILDI, CRC dogrulamasi yollaniyor ===\n",
+                   (unsigned)TOTAL_CHUNKS);
+          sending_final = 1;
+        }
+
+        /* FINAL'e cevap gelmediyse tekrar yolla */
+        if(waiting_ack) {
+          retries++;
+          if(retries > MAX_RETRIES) {
+            LOG_INFO("HATA: FINAL icin cevap yok, vazgeciliyor.\n");
+            break;
+          }
+          LOG_INFO("Timeout! FINAL tekrar (%u/%u)...\n",
+                   (unsigned)retries, (unsigned)MAX_RETRIES);
+        }
+
+        send_final(&dest_ipaddr, firmware_crc);
+        waiting_ack = 1;
       }
 
-      /* Blogu gonder ve ACK bekle */
-      send_chunk(&dest_ipaddr, current_chunk);
-      waiting_ack = 1;
-
-      /* Bekleme: timer DOLARSA timeout, process_poll gelirse ACK var */
+      /* Bekleme: timer DOLARSA timeout, process_poll gelirse cevap var */
       etimer_set(&timer, TIMEOUT_SEC * CLOCK_SECOND);
-      PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer) || !waiting_ack);
+      PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer) || !waiting_ack || need_restart);
     }
 
-    LOG_INFO("=== OTA TRANSFERI TAMAMLANDI! ===\n");
+    if(final_acked) {
+      LOG_INFO("=== OTA TRANSFERI BASARIYLA TAMAMLANDI! ===\n");
+    }
 
   } else {
     /* Dugum 3: sadece RPL relay, gonderici degil */
