@@ -1,0 +1,13 @@
+# Derleme ciktilari
+build/
+*.z1
+*.sky
+*.o
+*.map
+*.hex
+*.bin
+
+# Simulasyon log'lari
+sim-logs/
+*.testlog
+COOJA.log
