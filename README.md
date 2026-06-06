@@ -32,7 +32,7 @@ ota-cooja-firmware-update/
 
 ## 🎥 Demo Videosu
 
-**YouTube:** `BURAYA_YOUTUBE_LINKI_GELECEK`
+**YouTube:** https://youtu.be/UK_EMz3q1fc
 
 > Video, Cooja ortamında sistemin çalışmasını, kod parçalarını ve kullanılan CRC32 hash
 > algoritmasının teorisini içermektedir.
