@@ -102,103 +102,236 @@ iki davranış** elde etme yöntemidir.
 | + | **Kalıcı depolama** — flash benzeri saklama | CFS/Coffee (`cfs_write`) |
 | + | **OTA metadata** — Slot A/B güncelleme | `ota_metadata_*()` |
 
+### Parçalama ve Paket Oluşturma (`udp-client.c → send_chunk`)
+
+Gönderici, firmware'i 48 byte'lık bloklara böler ve her bloğun başına 8 byte'lık başlık
+ekler. Aşağıdaki kod doğrudan `send_chunk` fonksiyonumuzdandır:
+
+```c
+static void
+send_chunk(const uip_ipaddr_t *dest, uint16_t chunk_no)
+{
+  static uint8_t packet[HEADER_LEN + CHUNK_SIZE];
+  uint32_t offset;
+  uint8_t  payload_len;
+  uint8_t  cs;
+
+  /* Bu blogun firmware'deki baslangic yeri */
+  offset = (uint32_t)chunk_no * CHUNK_SIZE;
+
+  /* Son blok kismi olabilir (tam bolunmuyor) */
+  if(offset + CHUNK_SIZE > FIRMWARE_PAYLOAD_LEN) {
+    payload_len = (uint8_t)(FIRMWARE_PAYLOAD_LEN - offset);
+  } else {
+    payload_len = CHUNK_SIZE;
+  }
+
+  /* Firmware verisini pakete kopyala */
+  memcpy(&packet[HEADER_LEN], &firmware_payload[offset], payload_len);
+
+  /* Checksum hesapla (sadece payload uzerinden) */
+  cs = checksum8(&packet[HEADER_LEN], payload_len);
+
+  /* ── PAKET BASLIGI (8 byte) ──
+   *  [0-1] Magic | [2-3] Blok no | [4-5] Toplam | [6] Boyut | [7] Checksum */
+  packet[0] = (uint8_t)(OTA_MAGIC >> 8);
+  packet[1] = (uint8_t)(OTA_MAGIC);
+  packet[2] = (uint8_t)(chunk_no >> 8);
+  packet[3] = (uint8_t)(chunk_no);
+  packet[4] = (uint8_t)(TOTAL_CHUNKS >> 8);
+  packet[5] = (uint8_t)(TOTAL_CHUNKS);
+  packet[6] = payload_len;
+  packet[7] = cs;
+
+  simple_udp_sendto(&udp_conn, packet, HEADER_LEN + payload_len, dest);
+}
+```
+
+> Çok-byte alanlar **big-endian** (üst byte önce) yazılır; alıcı aynı sırayla okur.
+> Son blok 48'e tam bölünmezse `payload_len` kalan kadar küçülür.
+
 ---
 
-## 🔑 Kullanılan Algoritmalar (Teori)
+## 🔑 Kullanılan Algoritmalar (Kendi Kodumuzdan)
 
 Sistem **iki katmanlı doğrulama** kullanır: blok başına hızlı XOR checksum + tüm imaj
-için güçlü CRC32 hash.
+için güçlü CRC32 hash. Aşağıdaki kod parçaları doğrudan kaynak dosyalarımızdan alınmıştır.
 
 ### 1. XOR Checksum (blok başına — hızlı ön kontrol)
 
-Her bloğun yük byte'larının XOR'u alınarak 1 byte üretilir:
+> Kaynak: `udp-server.c` (alıcı) ve `udp-client.c` (gönderici) — birebir aynı fonksiyon.
 
 ```c
-static uint8_t checksum8(const uint8_t *data, uint8_t len) {
+/*---------------------------------------------------------------------------*/
+/* XOR checksum: payload byte'larinin XOR'u                                  */
+/*---------------------------------------------------------------------------*/
+static uint8_t
+checksum8(const uint8_t *data, uint8_t len)
+{
   uint8_t cs = 0;
-  for(uint8_t i = 0; i < len; i++) {
-    cs ^= data[i];          /* tüm byte'ları XOR'la */
+  uint8_t i;
+  for(i = 0; i < len; i++) {
+    cs ^= data[i];
   }
   return cs;
 }
 ```
 
 - **Amaç:** Tek blokta **bit hatası** tespiti — ucuz ve hızlı.
+- **Nasıl:** Bloğun tüm yük byte'larını XOR'layıp tek byte üretir. Gönderici bu değeri
+  paket başlığının 8. byte'ına koyar; alıcı aynı işlemi yapıp karşılaştırır.
 - **Sınırı:** İki bit aynı konumda bozulursa XOR değişmez, hatayı kaçırır. Bu yüzden
-  **tek başına yetmez** — tüm imaj CRC32 ile ayrıca doğrulanır.
+  **tek başına yetmez** — tüm imaj ayrıca CRC32 ile doğrulanır.
 
 ### 2. CRC32 (tüm imaj — güçlü bütünlük hash'i) ⭐
 
-**CRC = Cyclic Redundancy Check (Döngüsel Artıklık Denetimi).** Veri, sabit bir polinoma
-GF(2) (modulo-2) aritmetiğinde **bölünür**; **kalan** 32-bit CRC değerini verir.
-
-- **Polinom:** `0xEDB88320` — IEEE 802.3 (Ethernet), ZIP, PNG, gzip ile **aynı** standart
-  polinom (ters/reflected gösterim).
-- **Algoritma:**
+> Kaynak: `udp-server.c` — alıcı, bloklar geldikçe streaming (akan) CRC32 hesaplar.
 
 ```c
-static void crc32_stream_init(void)  { crc_state = 0xFFFFFFFFu; }   /* başlangıç */
+/*---------------------------------------------------------------------------*/
+/* Streaming CRC32 yardimci fonksiyonlari                                    */
+/*                                                                            */
+/* Neden bu? ota_crc32_buffer() tum bufferi istiyor (129KB RAM'e sigmaz).    */
+/* Biz bloklari geldikce CRC'yi guncelliyoruz, son bloktan sonra bitiriyoruz.*/
+/* Stop-and-wait ile bloklar sirali geldiginden bu dogru sonucu veriyor.     */
+/*---------------------------------------------------------------------------*/
+static void
+crc32_stream_init(void)
+{
+  crc_state = 0xFFFFFFFFu;
+}
 
-static void crc32_stream_update(const uint8_t *data, uint8_t len) {
+static void
+crc32_stream_update(const uint8_t *data, uint8_t len)
+{
+  /* Polynomial: 0xEDB88320 (IEEE 802.3 - zip/png/ethernet ile ayni) */
   while(len--) {
-    crc_state ^= *data++;                       /* byte'ı al */
-    for(uint8_t i = 0; i < 8; i++) {            /* 8 bit işle */
-      if(crc_state & 1u)
-        crc_state = (crc_state >> 1) ^ 0xEDB88320u;  /* polinomla XOR */
-      else
+    uint8_t i;
+    crc_state ^= *data++;
+    for(i = 0; i < 8; i++) {
+      if(crc_state & 1u) {
+        crc_state = (crc_state >> 1) ^ 0xEDB88320u;
+      } else {
         crc_state >>= 1;
+      }
     }
   }
 }
 
-static uint32_t crc32_stream_final(void) { return ~crc_state; }     /* bitiş: ters çevir */
+static uint32_t
+crc32_stream_final(void)
+{
+  return ~crc_state;
+}
 ```
 
-- **Neden CRC32, neden basit checksum değil?** CRC32, **burst (ardışık) hataları**, byte
+**Teori — bu kod ne yapıyor?**
+
+- **CRC = Cyclic Redundancy Check (Döngüsel Artıklık Denetimi).** Veri, sabit bir
+  polinoma GF(2) (modulo-2) aritmetiğinde **bölünür**; bölmenin **kalanı** 32-bit CRC
+  değeridir. `crc32_stream_update` içindeki "kaydır + koşullu XOR" döngüsü tam bu
+  polinom bölmesini bit bit gerçekler.
+- **Polinom `0xEDB88320`:** IEEE 802.3 (Ethernet), ZIP, PNG, gzip ile **aynı** standart
+  CRC32 polinomu (ters/reflected gösterim).
+- **Başlangıç `0xFFFFFFFF`, bitiş `~crc` (ters çevirme):** standart CRC32 uzlaşımı —
+  baştaki ve sondaki sıfırları da yakalayabilmek için.
+- **Neden CRC32, neden basit checksum değil?** CRC32 **burst (ardışık) hataları**, byte
   sırası değişimlerini ve eksik blokları yakalar; basit toplama/XOR bunları kaçırabilir.
-  Yanlış pozitif olasılığı 1/2³² ≈ pratikte sıfırdır.
-- **Streaming (akan) hesaplama:** 129 KB'lık firmware Z1'in 8 KB RAM'ine sığmaz. Bloklar
-  **sırayla** geldiğinden, her blok gelince CRC ara değeri güncellenir; tüm imaj hafızada
-  biriktirilmeden son blokta sonuçlandırılır.
+  Yanlış pozitif olasılığı 1/2³² ≈ pratikte sıfır.
+- **Neden streaming?** 129 KB'lık firmware Z1'in 8 KB RAM'ine sığmaz. Bloklar **sırayla**
+  geldiğinden, her blok gelince `crc32_stream_update` ara değeri günceller; tüm imaj
+  hafızada biriktirilmeden son blokta `crc32_stream_final` ile sonuçlandırılır.
 - ⚠️ **Önemli ayrım:** CRC32 bir **hata-tespit hash'idir**, **kriptografik değildir**.
-  Kötü niyetli (kasıtlı) değişikliğe karşı koruma için SHA-256 gibi kriptografik bir hash
-  gerekir. Bu projede amaç **iletim bütünlüğü** olduğundan CRC32 uygundur.
+  Kötü niyetli (kasıtlı) değişikliğe karşı SHA-256 gibi kriptografik bir hash gerekir.
+  Bu projede amaç **iletim bütünlüğü** olduğundan CRC32 uygundur.
+
+Alıcı, transfer bitince hesaplanan CRC32'yi loglar (`udp-server.c`):
+
+```c
+fw_crc = crc32_stream_final();
+LOG_INFO("Hesaplanan CRC32: 0x%08lx\n", (unsigned long)fw_crc);
+```
 
 ---
 
 ## 🚦 Protokol: Stop-and-Wait + Yeniden Gönderim
 
-Gönderici bir blok yollar, **ACK gelene kadar bekler**, sonra bir sonrakine geçer:
+Gönderici bir blok yollar, **ACK gelene kadar bekler**, sonra bir sonrakine geçer.
+Aşağıdaki ana döngü doğrudan `udp-client.c → PROCESS_THREAD(ota_sender_process)`'tendir:
 
 ```c
+/* ── ANA GONDERIM DONGUSU ── */
 while(!transfer_done) {
-  if(current_chunk >= TOTAL_CHUNKS) { transfer_done = 1; break; }   /* hepsi gitti */
 
-  if(waiting_ack) {                       /* önceki bloğa ACK gelmedi mi? */
-    retries++;
-    if(retries > MAX_RETRIES) {           /* 5 denemede gitmezse atla */
-      current_chunk++; waiting_ack = 0; retries = 0; continue;
-    }
+  /* Hepsi gonderildi mi? */
+  if(current_chunk >= TOTAL_CHUNKS) {
+    LOG_INFO("=== TUM %u BLOK GONDERILDI! ===\n", (unsigned)TOTAL_CHUNKS);
+    transfer_done = 1;
+    break;
   }
 
-  send_chunk(&dest_ipaddr, current_chunk);    /* bloğu gönder */
+  /* Ag hazir mi? */
+  if(!NETSTACK_ROUTING.node_is_reachable() ||
+     !NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
+    LOG_INFO("Ag hazir degil, 2 sn bekleniyor...\n");
+    etimer_set(&timer, 2 * CLOCK_SECOND);
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
+    continue;
+  }
+
+  /* Timeout kontrolu: onceki bloga ACK gelmedi mi? */
+  if(waiting_ack) {
+    retries++;
+    if(retries > MAX_RETRIES) {
+      LOG_INFO("HATA: Blok %u icin %u deneme yapildi, atlaniyor!\n",
+               (unsigned)current_chunk, (unsigned)MAX_RETRIES);
+      current_chunk++;
+      waiting_ack = 0;
+      retries = 0;
+      continue;
+    }
+    LOG_INFO("Timeout! Blok %u tekrar (%u/%u)...\n",
+             (unsigned)current_chunk, (unsigned)retries, (unsigned)MAX_RETRIES);
+  }
+
+  /* Blogu gonder ve ACK bekle */
+  send_chunk(&dest_ipaddr, current_chunk);
   waiting_ack = 1;
 
-  etimer_set(&timer, TIMEOUT_SEC * CLOCK_SECOND);   /* 5 sn timeout kur */
+  /* Bekleme: timer DOLARSA timeout, process_poll gelirse ACK var */
+  etimer_set(&timer, TIMEOUT_SEC * CLOCK_SECOND);
   PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer) || !waiting_ack);
-  /* ya timeout dolar (tekrar gönder) ya da ACK gelir (devam et) */
 }
 ```
 
-ACK callback'i, doğru bloğun ACK'i gelince süreci uyandırır:
+**Kilit satır** `PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer) || !waiting_ack)`:
+süreç ya 5 sn timeout dolunca (ACK gelmedi → tekrar gönder) ya da ACK callback'i
+`waiting_ack`'i sıfırlayınca (devam et) uyanır.
+
+ACK callback'i (`udp-client.c`), doğru bloğun ACK'i gelince süreci hemen uyandırır:
 
 ```c
-static void udp_rx_callback(..., const uint8_t *data, uint16_t datalen) {
-  if(datalen < 4 || data[0] != 'A' || data[1] != 'C') return;   /* OTA ACK değil */
-  uint16_t acked = ((uint16_t)data[2] << 8) | data[3];
-  if(acked == current_chunk) {
-    waiting_ack = 0; retries = 0; current_chunk++;
-    process_poll(&ota_sender_process);    /* süreci hemen uyandır */
+static void
+udp_rx_callback(struct simple_udp_connection *c,
+                const uip_ipaddr_t *sender_addr, uint16_t sender_port,
+                const uip_ipaddr_t *receiver_addr, uint16_t receiver_port,
+                const uint8_t *data, uint16_t datalen)
+{
+  uint16_t acked_chunk;
+
+  /* ACK paketi: [0]='A' [1]='C' [2]=chunk_yuksek [3]=chunk_dusuk */
+  if(datalen < 4 || data[0] != 'A' || data[1] != 'C') {
+    return; /* OTA ACK degil, yoksay */
+  }
+
+  acked_chunk = ((uint16_t)data[2] << 8) | data[3];
+
+  if(acked_chunk == current_chunk) {
+    LOG_INFO("ACK alindi: Blok %u onaylandi\n", acked_chunk);
+    waiting_ack = 0;  /* ACK geldi! */
+    retries     = 0;
+    current_chunk++;
+    process_poll(&ota_sender_process); /* Surecimizi uyandir: "devam et!" */
   }
 }
 ```
@@ -208,6 +341,12 @@ static void udp_rx_callback(..., const uint8_t *data, uint16_t datalen) {
 | `TIMEOUT_SEC` | 5 sn | ACK için bekleme süresi |
 | `MAX_RETRIES` | 5 | Bir blok için maksimum tekrar |
 | `CHUNK_SIZE` | 48 byte | Blok yük boyutu |
+
+> **Protothread notu:** Tüm durum değişkenleri (`current_chunk`, `waiting_ack`,
+> `retries`, `timer`, `dest_ipaddr`) `static`'tir — çünkü Contiki protothread'leri
+> yığınsızdır ve `PROCESS_WAIT` sırasında yerel değişkenleri kaybeder. Ayrıca
+> `PROCESS_END()` yalnızca fonksiyonun en sonunda bir kez bulunur; erken çağrılırsa
+> `switch-case` yapısı bozulup derleme hatası verir.
 
 ---
 
@@ -227,24 +366,83 @@ static void udp_rx_callback(..., const uint8_t *data, uint16_t datalen) {
 Alıcıda bozuk blok gelince **kasıtlı olarak ACK gönderilmez** — gönderici timeout sonrası
 aynı bloğu tekrar yollar (otomatik düzeltme).
 
+Alıcının (`udp-server.c → udp_rx_callback`) gerçek doğrulama zinciri — her paket sırayla
+bu kapılardan geçer:
+
+```c
+/* 1. Minimum uzunluk */
+if(datalen < HEADER_LEN) return;
+
+/* 2. Magic number (bu gerçekten OTA paketi mi?) */
+magic = ((uint16_t)data[0] << 8) | data[1];
+if(magic != OTA_MAGIC) return;
+
+/* 3. Header ayristirma */
+chunk_no     = ((uint16_t)data[2] << 8) | data[3];
+total_chunks = ((uint16_t)data[4] << 8) | data[5];
+payload_len  = data[6];
+recv_cs      = data[7];
+
+/* 4. Boyut tutarliligi (tampon tasmasi korumasi) */
+if(datalen != (uint16_t)(HEADER_LEN + payload_len)) return;
+
+/* 5. XOR checksum dogrulama (bozuksa ACK YOK -> tekrar gelir) */
+calc_cs = checksum8(&data[HEADER_LEN], payload_len);
+if(calc_cs != recv_cs) return;
+
+/* 7. Duplikat blok: sadece ACK don, CRC'yi bozma */
+if(chunk_no < next_expected) { /* ...ACK gonder... */ return; }
+
+/* 8. Sira disi blok: atla */
+if(chunk_no != next_expected) return;
+```
+
+Bu sıralı kapı yapısı, sadece **geçerli + doğru sıradaki + bozulmamış** bloğun CFS'e
+yazılıp CRC'ye dahil edilmesini garanti eder.
+
 ---
 
 ## 💾 Kalıcı Depolama ve OTA Metadata
 
-Alıcı (Düğüm 1) her bloğu **CFS (Coffee File System)** ile kalıcı belleğe yazar:
+Alıcı (Düğüm 1) her bloğu **CFS (Coffee File System)** ile kalıcı belleğe yazar.
+Aşağıdaki kod doğrudan `udp-server.c → udp_rx_callback`'tendir (hata kontrolleriyle):
 
 ```c
+/* Coffee File System: Z1'deki harici flash bellek (M25P16, 2MB).
+ * Blok N -> offset = N * 48 konumuna yaziyoruz. */
+offset = (uint32_t)chunk_no * CHUNK_SIZE;
 fd = cfs_open(FIRMWARE_FILE, CFS_WRITE);
-cfs_seek(fd, chunk_no * CHUNK_SIZE, CFS_SEEK_SET);   /* doğru offset'e */
-cfs_write(fd, &data[HEADER_LEN], payload_len);
+if(fd < 0) {
+  LOG_INFO("CFS acma HATASI! Blok %u kaydedilemedi\n", chunk_no);
+  return;
+}
+if(cfs_seek(fd, (cfs_offset_t)offset, CFS_SEEK_SET) < 0) {
+  LOG_INFO("CFS seek HATASI! offset=%lu\n", (unsigned long)offset);
+  cfs_close(fd);
+  return;
+}
+written = cfs_write(fd, &data[HEADER_LEN], payload_len);
 cfs_close(fd);
+
+if(written != (int)payload_len) {
+  LOG_INFO("CFS yazma HATASI! %d/%u byte (blok %u)\n", written, payload_len, chunk_no);
+  return;
+}
 ```
 
-Transfer tamamlanınca **dual-slot OTA metadata** güncellenir (`ota-metadata.h`):
+Transfer tamamlanınca **dual-slot OTA metadata** güncellenir. Aşağıdaki kod
+`udp-server.c → PROCESS_THREAD` sonundandır:
 
 ```c
-ota_metadata_mark_verified(&metadata, OTA_SLOT_B, version, size, crc);  /* Slot B = VERIFIED */
-ota_metadata_stage_verified_image(&metadata, OTA_SLOT_B);               /* Slot B = PENDING */
+memset(&metadata, 0, sizeof(metadata));
+metadata.magic       = OTA_IMAGE_MAGIC;
+metadata.active_slot = OTA_SLOT_A;
+
+/* Slot B'yi VERIFIED yap: boyut + CRC kaydet */
+ota_metadata_mark_verified(&metadata, OTA_SLOT_B, NEW_FW_VERSION, total_fw_size, fw_crc);
+
+/* Slot B'yi PENDING yap: bir sonraki boot'ta aktif olacak */
+ota_metadata_stage_verified_image(&metadata, OTA_SLOT_B);
 ```
 
 - **Slot A** = şu an çalışan firmware
