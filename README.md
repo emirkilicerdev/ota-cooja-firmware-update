@@ -9,25 +9,26 @@ Havadan Güncelleme)** prensibiyle bir firmware (bellenim) dosyasının düğüm
 
 ## 📁 Proje Konumu (Contiki-NG/examples)
 
-Bu bir **Contiki-NG örnek projesidir** ve `examples/rpl-udp/` dizini altında yer alır.
-Repo yapısı, Contiki-NG ağacındaki konumu birebir yansıtır:
+Bu bir **Contiki-NG örnek projesidir** ve `Contiki-NG/examples/rpl-udp/` dizini altında
+yer alır. Repo yapısı, Contiki-NG ağacındaki konumu birebir yansıtır:
 
 ```
 ota-cooja-firmware-update/
-├── README.md                      ← bu rapor
-└── examples/
-    └── rpl-udp/                    ← Contiki-NG/examples/rpl-udp projesi
-        ├── udp-client.c           ← OTA gönderici + relay
-        ├── udp-server.c           ← OTA alıcı (CFS + CRC32 + metadata)
-        ├── ota-metadata.h/.c      ← dual-slot boot metadata
-        ├── firmware_data.h        ← test firmware payload
-        ├── Makefile
-        └── BIL304-OS-Project-1.csc ← Cooja senaryosu (3 Z1 düğüm)
+├── README.md                          ← bu rapor
+└── Contiki-NG/
+    └── examples/
+        └── rpl-udp/                    ← Contiki-NG/examples/rpl-udp projesi
+            ├── udp-client.c           ← OTA gönderici + relay
+            ├── udp-server.c           ← OTA alıcı (CFS + CRC32 + metadata)
+            ├── ota-metadata.h/.c      ← dual-slot boot metadata
+            ├── firmware_data.h        ← test firmware payload
+            ├── Makefile
+            └── BIL304-OS-Project-1.csc ← Cooja senaryosu (3 Z1 düğüm)
 ```
 
-> **Çalıştırmak için:** `examples/rpl-udp/` klasörünü bir Contiki-NG kurulumunun
-> `contiki-ng/examples/` dizini altına kopyalayın, ardından aşağıdaki derleme adımlarını
-> izleyin.
+> **Çalıştırmak için:** `Contiki-NG/examples/rpl-udp/` klasörünü gerçek bir Contiki-NG
+> kurulumunun `contiki-ng/examples/` dizini altına kopyalayın, ardından aşağıdaki derleme
+> adımlarını izleyin.
 
 ## 🎥 Demo Videosu
 
